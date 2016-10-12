@@ -601,10 +601,20 @@ class receiveDataThread(threading.Thread):
         # the right child stream.
         with shared.knownNodesLock:
             if len(shared.knownNodes[self.streamNumber]) > 0:
+                ownPosition = random.randint(0, 499)
+                sentOwn = False
                 for i in range(500):
-                    peer, = random.sample(shared.knownNodes[self.streamNumber], 1)
+                    # if current connection is over a proxy, sent our own onion address at a random position
+                    if ownPosition == i and ".onion" in shared.config.get("bitmessagesettings", "onionhostname") and \
+                        hasattr(self.sock, "getproxytype") and self.sock.getproxytype() != "none" and not sentOwn:
+                        peer = shared.Peer(shared.config.get("bitmessagesettings", "onionhostname"), shared.config.getint("bitmessagesettings", "onionport"))
+                    else:
+                    # still may contain own onion address, but we don't change it
+                        peer, = random.sample(shared.knownNodes[self.streamNumber], 1)
                     if isHostInPrivateIPRange(peer.host):
                         continue
+                    if peer.host == shared.config.get("bitmessagesettings", "onionhostname") and peer.port == shared.config.getint("bitmessagesettings", "onionport") :
+                        sentOwn = True
                     addrsInMyStream[peer] = shared.knownNodes[
                         self.streamNumber][peer]
             if len(shared.knownNodes[self.streamNumber * 2]) > 0:
@@ -757,6 +767,8 @@ class receiveDataThread(threading.Thread):
         if not isHostInPrivateIPRange(self.peer.host):
             with shared.knownNodesLock:
                 shared.knownNodes[self.streamNumber][shared.Peer(self.peer.host, self.remoteNodeIncomingPort)] = int(time.time())
+                if not self.initiatedConnection:
+                    shared.knownNodes[self.streamNumber][shared.Peer(self.peer.host, self.remoteNodeIncomingPort)] -= 162000 # penalise inbound, 2 days minus 3 hours
                 shared.needToWriteKnownNodesToDisk = True
 
         self.sendverack()

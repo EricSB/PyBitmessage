@@ -35,14 +35,30 @@ class outgoingSynSender(threading.Thread, StoppableThread):
             shared.knownNodes[self.streamNumber][peer] = time.time()
             shared.knownNodesLock.release()
         else:
-            while True:
+            while not shared.shutdown:
                 shared.knownNodesLock.acquire()
-                peer, = random.sample(shared.knownNodes[self.streamNumber], 1)
+                try:
+                    peer, = random.sample(shared.knownNodes[self.streamNumber], 1)
+                except ValueError: # no known nodes
+                    shared.knownNodesLock.release()
+                    time.sleep(1)
+                    continue
+                priority = (183600 - (time.time() - shared.knownNodes[self.streamNumber][peer])) / 183600 # 2 days and 3 hours
                 shared.knownNodesLock.release()
-                if shared.config.get('bitmessagesettings', 'socksproxytype') != 'none' or peer.host.find(".onion") == -1:
+                if shared.config.get('bitmessagesettings', 'socksproxytype') != 'none':
+                    if peer.host.find(".onion") == -1:
+                        priority /= 10 # hidden services have 10x priority over plain net
+                elif peer.host.find(".onion") != -1: # onion address and so proxy
+                    continue
+                if priority <= 0.001: # everyone has at least this much priority
+                    priority = 0.001
+                if (random.random() <=  priority):
                     break
-                time.sleep(1)
-        return peer
+                time.sleep(0.01) # prevent CPU hogging if something is broken
+        try:
+            return peer
+        except NameError:
+            return shared.Peer('127.0.0.1', 8444)
         
     def stopThread(self):
         super(outgoingSynSender, self).stopThread()
@@ -85,6 +101,8 @@ class outgoingSynSender(threading.Thread, StoppableThread):
                 shared.alreadyAttemptedConnectionsListLock.release()
             except threading.ThreadError as e:
                 pass
+            if shared.shutdown:
+                break
             self.name = "outgoingSynSender-" + peer.host.replace(":", ".") # log parser field separator
             if peer.host.find(':') == -1:
                 address_family = socket.AF_INET
@@ -211,8 +229,11 @@ class outgoingSynSender(threading.Thread, StoppableThread):
                     'updateStatusBar', tr._translate(
                     "MainWindow", "SOCKS5 Authentication problem: %1").arg(str(err))))
             except socks.Socks5Error as err:
-                pass
-                logger.error('SOCKS5 error. (It is possible that the server wants authentication).) ' + str(err))
+                if err[0] in [3, 4, 5, 6]:
+                    # this is a more bening "error": host unreachable, network unreachable, connection refused, TTL expired
+                    logger.debug('SOCKS5 error. ' + str(err))
+                else:
+                    logger.error('SOCKS5 error. ' + str(err))
             except socks.Socks4Error as err:
                 logger.error('Socks4Error: ' + str(err))
             except socket.error as err:

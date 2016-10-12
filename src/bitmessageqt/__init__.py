@@ -1,10 +1,13 @@
 from debug import logger
 withMessagingMenu = False
 try:
+    import gi
+    gi.require_version('MessagingMenu', '1.0')
     from gi.repository import MessagingMenu
+    gi.require_version('Notify', '0.7')
     from gi.repository import Notify
     withMessagingMenu = True
-except ImportError:
+except (ImportError, ValueError):
     MessagingMenu = None
 
 try:
@@ -105,16 +108,20 @@ def change_translation(locale):
     QtGui.QApplication.installTranslator(qsystranslator)
 
     lang = pythonlocale.normalize(l10n.getTranslationLanguage())
+    langs = [lang.split(".")[0] + "." + l10n.encoding, lang.split(".")[0] + "." + 'UTF-8', lang]
     if 'win32' in sys.platform or 'win64' in sys.platform:
-        lang = l10n.getWindowsLocale(lang)
-    try:
-        pythonlocale.setlocale(pythonlocale.LC_ALL, lang)
-        if 'win32' not in sys.platform and 'win64' not in sys.platform:
-            l10n.encoding = pythonlocale.nl_langinfo(pythonlocale.CODESET)
-        else:
-            l10n.encoding = pythonlocale.getlocale()[1]
-    except:
-        logger.error("Failed to set locale to %s", lang, exc_info=True)
+        langs = [l10n.getWindowsLocale(lang)]
+    for lang in langs:
+        try:
+            pythonlocale.setlocale(pythonlocale.LC_ALL, lang)
+            if 'win32' not in sys.platform and 'win64' not in sys.platform:
+                l10n.encoding = pythonlocale.nl_langinfo(pythonlocale.CODESET)
+            else:
+                l10n.encoding = pythonlocale.getlocale()[1]
+            logger.info("Successfully set locale to %s", lang)
+            break
+        except:
+            logger.error("Failed to set locale to %s", lang, exc_info=True)
 
 class MyForm(settingsmixin.SMainWindow):
 
@@ -256,6 +263,10 @@ class MyForm(settingsmixin.SMainWindow):
             _translate(
                 "MainWindow", "Email gateway"),
             self.on_action_EmailGatewayDialog)
+        self.actionMarkAllRead = self.ui.addressContextMenuToolbarYourIdentities.addAction(
+            _translate(
+                "MainWindow", "Mark all messages as read"),
+            self.on_action_MarkAllRead)
 
         self.ui.treeWidgetYourIdentities.setContextMenuPolicy(
             QtCore.Qt.CustomContextMenu)
@@ -902,65 +913,57 @@ class MyForm(settingsmixin.SMainWindow):
         self.ui.tabWidget.setCurrentIndex(3)
         
     def propagateUnreadCount(self, address = None, folder = "inbox", widget = None, type = 1):
-        def updateUnreadCount(item):
-            # if refreshing the account root, we need to rescan folders
-            if type == 0 or (folder is None and isinstance(item, Ui_FolderWidget)):
-                if addressItem.type in [AccountMixin.SUBSCRIPTION, AccountMixin.MAILINGLIST]:
-                    xAddress = "fromaddress"
-                else:
-                    xAddress = "toaddress"
-                xFolder = folder
-                if isinstance(item, Ui_FolderWidget):
-                    xFolder = item.folderName
-                if xFolder == "new":
-                    xFolder = "inbox"
-                if addressItem.type == AccountMixin.ALL:
-                    if xFolder:
-                        queryreturn = sqlQuery("SELECT COUNT(*) FROM inbox WHERE folder = ? AND read = 0", xFolder)
-                    else:
-                        queryreturn = sqlQuery("SELECT COUNT(*) FROM inbox WHERE read = 0")
-                else:
-                    if address and xFolder:
-                        queryreturn = sqlQuery("SELECT COUNT(*) FROM inbox WHERE " + xAddress + " = ? AND folder = ? AND read = 0", address, xFolder)
-                    elif address:
-                        queryreturn = sqlQuery("SELECT COUNT(*) FROM inbox WHERE " + xAddress + " = ? AND read = 0", address)
-                for row in queryreturn:
-                    item.setUnreadCount(int(row[0]))
-                if isinstance(item, Ui_AddressWidget) and item.type == AccountMixin.ALL:
-                    self.drawTrayIcon(self.currentTrayIconFileName, self.findInboxUnreadCount())
-            elif type == 1:
-                item.setUnreadCount(item.unreadCount + 1)
-                if isinstance(item, Ui_AddressWidget) and item.type == AccountMixin.ALL:
-                    self.drawTrayIcon(self.currentTrayIconFileName, self.findInboxUnreadCount(self.unreadCount + 1))
-            elif type == -1:
-                item.setUnreadCount(item.unreadCount - 1)
-                if isinstance(item, Ui_AddressWidget) and item.type == AccountMixin.ALL:
-                    self.drawTrayIcon(self.currentTrayIconFileName, self.findInboxUnreadCount(self.unreadCount -1))
-                
         widgets = [self.ui.treeWidgetYourIdentities, self.ui.treeWidgetSubscriptions, self.ui.treeWidgetChans]
+        queryReturn = sqlQuery("SELECT toaddress, folder, COUNT(msgid) AS cnt FROM inbox WHERE read = 0 GROUP BY toaddress, folder")
+        totalUnread = {}
+        normalUnread = {}
+        for row in queryReturn:
+            normalUnread[row[0]] = {}
+            if row[1] in ["trash"]:
+                continue
+            normalUnread[row[0]][row[1]] = row[2]
+            if row[1] in totalUnread:
+                totalUnread[row[1]] += row[2]
+            else:
+                totalUnread[row[1]] = row[2]
+        queryReturn = sqlQuery("SELECT fromaddress, folder, COUNT(msgid) AS cnt FROM inbox WHERE read = 0 AND toaddress = ? GROUP BY fromaddress, folder", str_broadcast_subscribers)
+        broadcastsUnread = {}
+        for row in queryReturn:
+            broadcastsUnread[row[0]] = {}
+            broadcastsUnread[row[0]][row[1]] = row[2]
+        
         for treeWidget in widgets:
             root = treeWidget.invisibleRootItem()
             for i in range(root.childCount()):
                 addressItem = root.child(i)
-                if addressItem.type != AccountMixin.ALL and address is not None and addressItem.data(0, QtCore.Qt.UserRole) != address:
-                    continue
-                if folder not in ["trash"]:
-                    updateUnreadCount(addressItem)
+                newCount = 0
+                if addressItem.type == AccountMixin.ALL:
+                    newCount = sum(totalUnread.itervalues())
+                    self.drawTrayIcon(self.currentTrayIconFileName, newCount)
+                elif addressItem.type == AccountMixin.SUBSCRIPTION:
+                    if addressItem.address in broadcastsUnread:
+                        newCount = sum(broadcastsUnread[addressItem.address].itervalues())
+                elif addressItem.address in normalUnread:
+                    newCount = sum(normalUnread[addressItem.address].itervalues())
+                if newCount != addressItem.unreadCount:
+                    addressItem.setUnreadCount(newCount)
                 if addressItem.childCount == 0:
                     continue
                 for j in range(addressItem.childCount()):
                     folderItem = addressItem.child(j)
-                    if folderItem.folderName == "new" and (folder is None or folder in ["inbox", "new"]):
-                        updateUnreadCount(folderItem)
-                        continue
-                    if folder is None and folderItem.folderName != "inbox":
-                        continue
-                    if folder is not None and ((folder == "new" and folderItem.folderName != "inbox") or \
-                        (folder != "new" and folderItem.folderName != folder)):
-                        continue
-                    if folder in ["sent", "trash"] and folderItem.folderName != folder:
-                        continue
-                    updateUnreadCount(folderItem)
+                    newCount = 0
+                    folderName = folderItem.folderName
+                    if folderName == "new":
+                        folderName = "inbox"
+                    if addressItem.type == AccountMixin.ALL and folderName in totalUnread:
+                        newCount = totalUnread[folderName]
+                    elif addressItem.type == AccountMixin.SUBSCRIPTION:
+                        if addressItem.address in broadcastsUnread and folderName in broadcastsUnread[addressItem.address]:
+                            newCount = broadcastsUnread[addressItem.address][folderName]
+                    elif addressItem.address in normalUnread and folderName in normalUnread[addressItem.address]:
+                        newCount = normalUnread[addressItem.address][folderName]
+                    if newCount != folderItem.unreadCount:
+                        folderItem.setUnreadCount(newCount)
 
     def addMessageListItem(self, tableWidget, items):
         sortingEnabled = tableWidget.isSortingEnabled()
@@ -1934,7 +1937,7 @@ class MyForm(settingsmixin.SMainWindow):
             fromAddress = str(self.ui.comboBoxSendFrom.itemData(
                 self.ui.comboBoxSendFrom.currentIndex(), 
                 Qt.UserRole).toString())
-            toAddresses = str(self.ui.lineEditTo.text())
+            toAddresses = str(self.ui.lineEditTo.text().toUtf8())
             subject = str(self.ui.lineEditSubject.text().toUtf8())
             message = str(
                 self.ui.textEditMessage.document().toPlainText().toUtf8())
@@ -2139,12 +2142,14 @@ class MyForm(settingsmixin.SMainWindow):
 
     def click_pushButtonFetchNamecoinID(self):
         nc = namecoinConnection()
-        err, addr = nc.query(str(self.ui.lineEditTo.text()))
+        identities = str(self.ui.lineEditTo.text().toUtf8()).split(";")
+        err, addr = nc.query(identities[-1].strip())
         if err is not None:
             self.statusBar().showMessage(_translate(
                 "MainWindow", "Error: " + err))
         else:
-            self.ui.lineEditTo.setText(addr)
+            identities[-1] = addr
+            self.ui.lineEditTo.setText("; ".join(identities))
             self.statusBar().showMessage(_translate(
                 "MainWindow", "Fetched address from namecoin identity."))
 
@@ -2364,8 +2369,7 @@ class MyForm(settingsmixin.SMainWindow):
                 
             lang = str(self.settingsDialogInstance.ui.languageComboBox.itemData(self.settingsDialogInstance.ui.languageComboBox.currentIndex()).toString())
             shared.config.set('bitmessagesettings', 'userlocale', lang)
-            logger.debug("Setting locale to %s", lang)
-            change_translation(lang)
+            change_translation(l10n.getTranslationLanguage())
             
             if int(shared.config.get('bitmessagesettings', 'port')) != int(self.settingsDialogInstance.ui.lineEditTCPPort.text()):
                 if not shared.safeConfigGetBoolean('bitmessagesettings', 'dontconnect'):
@@ -2630,7 +2634,40 @@ class MyForm(settingsmixin.SMainWindow):
                 #print "well nothing"
 #            shared.writeKeysFile()
 #            self.rerenderInboxToLabels()
-    
+
+    def on_action_MarkAllRead(self):
+        if QtGui.QMessageBox.question(self, "Marking all messages as read?", _translate("MainWindow", "Are you sure you would like to mark all messages read?"), QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes:
+            return
+        addressAtCurrentRow = self.getCurrentAccount()
+        tableWidget = self.getCurrentMessagelist()
+
+        if tableWidget.rowCount() == 0:
+            return
+
+        msgids = []
+        
+        font = QFont()
+        font.setBold(False)
+
+        for i in range(0, tableWidget.rowCount()):
+            msgids.append(str(tableWidget.item(
+                i, 3).data(Qt.UserRole).toPyObject()))
+            tableWidget.item(i, 0).setUnread(False)
+            tableWidget.item(i, 1).setUnread(False)
+            tableWidget.item(i, 2).setUnread(False)
+            tableWidget.item(i, 3).setFont(font)
+
+        markread = 0
+        if self.getCurrentFolder() == 'sent':
+            markread = sqlExecute(
+               "UPDATE sent SET read = 1 WHERE ackdata IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
+        else:
+            markread = sqlExecute(
+               "UPDATE inbox SET read = 1 WHERE msgid IN(%s) AND read=0" %(",".join("?"*len(msgids))), *msgids)
+
+        if markread > 0:
+            self.propagateUnreadCount(addressAtCurrentRow, self.getCurrentFolder(), None, 0)
+
     def click_NewAddressDialog(self):
         addresses = []
         for addressInKeysFile in getSortedAccounts():
@@ -3285,19 +3322,20 @@ class MyForm(settingsmixin.SMainWindow):
 
     def on_context_menuSubscriptions(self, point):
         currentItem = self.getCurrentItem()
-        if not isinstance(currentItem, Ui_AddressWidget):
-            return
         self.popMenuSubscriptions = QtGui.QMenu(self)
-        self.popMenuSubscriptions.addAction(self.actionsubscriptionsNew)
-        self.popMenuSubscriptions.addAction(self.actionsubscriptionsDelete)
-        self.popMenuSubscriptions.addSeparator()
-        if currentItem.isEnabled:
-            self.popMenuSubscriptions.addAction(self.actionsubscriptionsDisable)
-        else:
-            self.popMenuSubscriptions.addAction(self.actionsubscriptionsEnable)
-        self.popMenuSubscriptions.addAction(self.actionsubscriptionsSetAvatar)
-        self.popMenuSubscriptions.addSeparator()
-        self.popMenuSubscriptions.addAction(self.actionsubscriptionsClipboard)
+        if isinstance(currentItem, Ui_AddressWidget):
+            self.popMenuSubscriptions.addAction(self.actionsubscriptionsNew)
+            self.popMenuSubscriptions.addAction(self.actionsubscriptionsDelete)
+            self.popMenuSubscriptions.addSeparator()
+            if currentItem.isEnabled:
+                self.popMenuSubscriptions.addAction(self.actionsubscriptionsDisable)
+            else:
+                self.popMenuSubscriptions.addAction(self.actionsubscriptionsEnable)
+            self.popMenuSubscriptions.addAction(self.actionsubscriptionsSetAvatar)
+            self.popMenuSubscriptions.addSeparator()
+            self.popMenuSubscriptions.addAction(self.actionsubscriptionsClipboard)
+            self.popMenuSubscriptions.addSeparator()
+        self.popMenuSubscriptions.addAction(self.actionMarkAllRead)
         self.popMenuSubscriptions.exec_(
             self.ui.treeWidgetSubscriptions.mapToGlobal(point))
 
@@ -3632,39 +3670,41 @@ class MyForm(settingsmixin.SMainWindow):
         
     def on_context_menuYourIdentities(self, point):
         currentItem = self.getCurrentItem()
-        if not isinstance(currentItem, Ui_AddressWidget):
-            return
         self.popMenuYourIdentities = QtGui.QMenu(self)
-        self.popMenuYourIdentities.addAction(self.actionNewYourIdentities)
-        self.popMenuYourIdentities.addSeparator()
-        self.popMenuYourIdentities.addAction(self.actionClipboardYourIdentities)
-        self.popMenuYourIdentities.addSeparator()
-        if currentItem.isEnabled:
-            self.popMenuYourIdentities.addAction(self.actionDisableYourIdentities)
-        else:
-            self.popMenuYourIdentities.addAction(self.actionEnableYourIdentities)
-        self.popMenuYourIdentities.addAction(self.actionSetAvatarYourIdentities)
-        self.popMenuYourIdentities.addAction(self.actionSpecialAddressBehaviorYourIdentities)
-        self.popMenuYourIdentities.addAction(self.actionEmailGateway)
+        if isinstance(currentItem, Ui_AddressWidget):
+            self.popMenuYourIdentities.addAction(self.actionNewYourIdentities)
+            self.popMenuYourIdentities.addSeparator()
+            self.popMenuYourIdentities.addAction(self.actionClipboardYourIdentities)
+            self.popMenuYourIdentities.addSeparator()
+            if currentItem.isEnabled:
+                self.popMenuYourIdentities.addAction(self.actionDisableYourIdentities)
+            else:
+                self.popMenuYourIdentities.addAction(self.actionEnableYourIdentities)
+            self.popMenuYourIdentities.addAction(self.actionSetAvatarYourIdentities)
+            self.popMenuYourIdentities.addAction(self.actionSpecialAddressBehaviorYourIdentities)
+            self.popMenuYourIdentities.addAction(self.actionEmailGateway)
+            self.popMenuYourIdentities.addSeparator()
+        self.popMenuYourIdentities.addAction(self.actionMarkAllRead)
         self.popMenuYourIdentities.exec_(
             self.ui.treeWidgetYourIdentities.mapToGlobal(point))
 
     # TODO make one popMenu
     def on_context_menuChan(self, point):
         currentItem = self.getCurrentItem()
-        if not isinstance(currentItem, Ui_AddressWidget):
-            return
         self.popMenu = QtGui.QMenu(self)
-        self.popMenu.addAction(self.actionNew)
-        self.popMenu.addAction(self.actionDelete)
-        self.popMenu.addSeparator()
-        self.popMenu.addAction(self.actionClipboard)
-        self.popMenu.addSeparator()
-        if currentItem.isEnabled:
-            self.popMenu.addAction(self.actionDisable)
-        else:
-            self.popMenu.addAction(self.actionEnable)
-        self.popMenu.addAction(self.actionSetAvatar)
+        if isinstance(currentItem, Ui_AddressWidget):
+            self.popMenu.addAction(self.actionNew)
+            self.popMenu.addAction(self.actionDelete)
+            self.popMenu.addSeparator()
+            self.popMenu.addAction(self.actionClipboard)
+            self.popMenu.addSeparator()
+            if currentItem.isEnabled:
+                self.popMenu.addAction(self.actionDisable)
+            else:
+                self.popMenu.addAction(self.actionEnable)
+            self.popMenu.addAction(self.actionSetAvatar)
+            self.popMenu.addSeparator()
+        self.popMenu.addAction(self.actionMarkAllRead)
         self.popMenu.exec_(
             self.ui.treeWidgetChans.mapToGlobal(point))
 
@@ -3756,6 +3796,9 @@ class MyForm(settingsmixin.SMainWindow):
         if messagelist:
             account = self.getCurrentAccount()
             folder = self.getCurrentFolder()
+            treeWidget = self.getCurrentTreeWidget()
+            # refresh count indicator
+            self.propagateUnreadCount(account.address if hasattr(account, 'address') else None, folder, treeWidget, 0)
             self.loadMessagelist(messagelist, account, folder, searchOption, searchLine)
 
     def treeWidgetItemChanged(self, item, column):
@@ -4139,10 +4182,10 @@ class settingsDialog(QtGui.QDialog):
                 "MainWindow", "Testing..."))
         options = {}
         options["type"] = self.getNamecoinType()
-        options["host"] = self.ui.lineEditNamecoinHost.text()
-        options["port"] = self.ui.lineEditNamecoinPort.text()
-        options["user"] = self.ui.lineEditNamecoinUser.text()
-        options["password"] = self.ui.lineEditNamecoinPassword.text()
+        options["host"] = str(self.ui.lineEditNamecoinHost.text().toUtf8())
+        options["port"] = str(self.ui.lineEditNamecoinPort.text().toUtf8())
+        options["user"] = str(self.ui.lineEditNamecoinUser.text().toUtf8())
+        options["password"] = str(self.ui.lineEditNamecoinPassword.text().toUtf8())
         nc = namecoinConnection(options)
         response = nc.test()
         responseStatus = response[0]

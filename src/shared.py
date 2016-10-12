@@ -1,6 +1,6 @@
 ﻿from __future__ import division
 
-softwareVersion = '0.6.0'
+softwareVersion = '0.6.1'
 verbose = 1
 maximumAgeOfAnObjectThatIAmWillingToAccept = 216000  # This is obsolete with the change to protocol v3 but the singleCleaner thread still hasn't been updated so we need this a little longer.
 lengthOfTimeToHoldOnToAllPubkeys = 2419200  # Equals 4 weeks. You could make this longer if you want but making it shorter would not be advisable because there is a very small possibility that it could keep you from obtaining a needed pubkey for a period of time.
@@ -123,6 +123,9 @@ trustedPeer = None
 # For UPnP
 extPort = None
 
+# for Tor hidden service
+socksIP = None
+
 #Compiled struct for packing/unpacking headers
 #New code should use CreatePacket instead of Header.pack
 Header = Struct('!L12sL4s')
@@ -243,6 +246,14 @@ def haveSSL(server = False):
     elif sys.version_info >= (2,7,9):
         return True
     return False
+
+def checkSocksIP(host):
+    try:
+        if socksIP is None or not socksIP:
+            socksIP = socket.gethostbyname(config.get("bitmessagesettings", "sockshostname"))
+    except NameError:
+       socksIP = socket.gethostbyname(config.get("bitmessagesettings", "sockshostname"))
+    return socksIP == host
         
 def assembleVersionMessage(remoteHost, remotePort, myStreamNumber, server = False):
     payload = ''
@@ -252,15 +263,26 @@ def assembleVersionMessage(remoteHost, remotePort, myStreamNumber, server = Fals
 
     payload += pack(
         '>q', 1)  # boolservices of remote connection; ignored by the remote host.
-    payload += encodeHost(remoteHost)
-    payload += pack('>H', remotePort)  # remote IPv6 and port
+    if checkSocksIP(remoteHost) and server: # prevent leaking of tor outbound IP
+        payload += encodeHost('127.0.0.1')
+        payload += pack('>H', 8444)
+    else:
+        payload += encodeHost(remoteHost)
+        payload += pack('>H', remotePort)  # remote IPv6 and port
 
     payload += pack('>q', 1)  # bitflags of the services I offer.
     payload += '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xFF\xFF' + pack(
         '>L', 2130706433)  # = 127.0.0.1. This will be ignored by the remote host. The actual remote connected IP will be used.
-    if safeConfigGetBoolean('bitmessagesettings', 'upnp') and extPort:
+    # we have a separate extPort and
+    # incoming over clearnet or
+    # outgoing through clearnet
+    if safeConfigGetBoolean('bitmessagesettings', 'upnp') and extPort \
+        and ((server and not checkSocksIP(remoteHost)) or \
+        (config.get("bitmessagesettings", "socksproxytype") == "none" and not server)):
         payload += pack('>H', extPort)
-    else:
+    elif checkSocksIP(remoteHost) and server: # incoming connection over Tor
+        payload += pack('>H', shared.config.getint('bitmessagesettings', 'onionport'))
+    else: # no extPort and not incoming over Tor
         payload += pack('>H', shared.config.getint('bitmessagesettings', 'port'))
 
     random.seed()
@@ -378,6 +400,12 @@ def safeConfigGetBoolean(section,field):
         return config.getboolean(section,field)
     except Exception, err:
         return False
+
+def safeConfigGet(section, option, default = None):
+    if config.has_option (section, option):
+        return config.get(section, option)
+    else:
+        return default
 
 def decodeWalletImportFormat(WIFstring):
     fullString = arithmetic.changebase(WIFstring,58,256)
